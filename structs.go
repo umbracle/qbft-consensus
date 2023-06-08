@@ -92,6 +92,21 @@ type QBFTMessagePayload struct {
 	NewBlockMessage    *NewBlockMessage
 }
 
+func (q *QBFTMessagePayload) Round() uint64 {
+	if q.ProposalMessage != nil {
+		return q.ProposalMessage.Payload.UnsignedPayload.Proposal.Round
+	} else if q.PrepareMessage != nil {
+		return q.PrepareMessage.Payload.UnsignedPayload.Prepare.Round
+	} else if q.CommitMessage != nil {
+		return q.CommitMessage.Payload.UnsignedPayload.Commit.Round
+	} else if q.RoundChangeMessage != nil {
+		return q.RoundChangeMessage.Payload.UnsignedPayload.RoundChange.Round
+	} else if q.NewBlockMessage != nil {
+		panic("TODO")
+	}
+	panic("TODO")
+}
+
 func (q *QBFTMessagePayload) Height() uint64 {
 	if q.ProposalMessage != nil {
 		return q.ProposalMessage.Payload.UnsignedPayload.Proposal.Height

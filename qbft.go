@@ -3,26 +3,30 @@ package qbft
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
-	"os"
 	"time"
 )
 
 type Timer interface {
+	TimeCh() <-chan time.Time
 	SetTimeout(n time.Duration)
 }
 
 type Config struct {
-	Transport Transport
-	Logger    *log.Logger
-	Signer    Signer
-	Timer     Timer
+	Transport    Transport
+	Logger       *log.Logger
+	Signer       Signer
+	Timer        Timer
+	RoundTimeout time.Duration
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		Logger: log.New(os.Stderr, "", log.LstdFlags),
+		Logger:       log.New(ioutil.Discard, "", log.LstdFlags),
+		Timer:        newDefaultTimer(),
+		RoundTimeout: 10 * time.Second,
 	}
 }
 
@@ -33,6 +37,12 @@ func (c *Config) ApplyOps(opts ...ConfigOption) {
 }
 
 type ConfigOption func(*Config)
+
+func WithRoundTimeout(timeout time.Duration) ConfigOption {
+	return func(c *Config) {
+		c.RoundTimeout = timeout
+	}
+}
 
 func WithTimer(t Timer) ConfigOption {
 	return func(c *Config) {
@@ -70,7 +80,7 @@ func New(localID NodeID, opts ...ConfigOption) *QBFT {
 	q := &QBFT{
 		config:  cfg,
 		msgCh:   make(chan QBFTMessageWithRecipient, 1000), // for testing
-		state:   newState(),
+		state:   newState(cfg.Timer),
 		localID: localID,
 	}
 	return q
@@ -137,6 +147,7 @@ func (q *QBFT) SetBackend(b Backend) {
 	q.backend = b
 	q.state.resetState(b.ValidatorSet())
 	q.startNewRound(0)
+	q.resCh = make(chan struct{})
 }
 
 func (q *QBFT) Close() {
@@ -144,7 +155,6 @@ func (q *QBFT) Close() {
 }
 
 func (q *QBFT) Run() chan struct{} {
-	q.resCh = make(chan struct{})
 	q.stopCh = make(chan struct{})
 
 	go q.runImpl()
@@ -171,15 +181,12 @@ func (q *QBFT) runImpl() {
 	}
 
 	for {
-		fmt.Println("- iter -", q.localID, q.resCh)
-
 		select {
 		case msg := <-msgs:
-			q.handleMessage(msg)
+			q.handleMessage(&msg)
 
-		case <-q.state.timeoutTimer.C:
-			fmt.Println("SZSSS")
-			q.startNewRoundAndSendRoundChange(q.state.round + 1)
+		case <-q.state.timer.TimeCh():
+			q.handleMessage(nil)
 
 		case <-q.stopCh:
 			q.config.Logger.Printf("[INFO]: Node is out")
@@ -237,7 +244,12 @@ func (q *QBFT) buildInitialProposal() error {
 	return nil
 }
 
-func (q *QBFT) handleMessage(m QBFTMessageWithRecipient) {
+func (q *QBFT) handleMessage(m *QBFTMessageWithRecipient) {
+	if m == nil {
+		q.startNewRoundAndSendRoundChange(q.state.round + 1)
+		return
+	}
+
 	msg := m.Message
 
 	if m.Message.Height() != q.backend.Height() {
@@ -247,22 +259,22 @@ func (q *QBFT) handleMessage(m QBFTMessageWithRecipient) {
 	}
 
 	if msg.PrepareMessage != nil {
-		if err := q.uponPrepare(m); err != nil {
+		if err := q.uponPrepare(*m); err != nil {
 			panic(err)
 		}
 
 	} else if msg.ProposalMessage != nil {
-		if err := q.uponProposal(m); err != nil {
+		if err := q.uponProposal(*m); err != nil {
 			panic(err)
 		}
 
 	} else if msg.CommitMessage != nil {
-		if err := q.uponCommit(m); err != nil {
+		if err := q.uponCommit(*m); err != nil {
 			panic(err)
 		}
 
 	} else if msg.RoundChangeMessage != nil {
-		if err := q.uponRoundChange(m); err != nil {
+		if err := q.uponRoundChange(*m); err != nil {
 			panic(err)
 		}
 	}
@@ -294,36 +306,40 @@ func (q *QBFT) recoverSigner(msg SignedContainer) (NodeID, error) {
 
 // getExtendedRCC returns the highest round change set
 func (q *QBFT) getExtendedRCC() (*messageSet[RoundChangeMessage], uint64) {
-	curRound := q.state.round
-
 	var rccSet *messageSet[RoundChangeMessage]
 	var maxRound uint64
-
-	fmt.Println("_ get extended rcc _")
 
 	// Using the 'messageSet' routing we ensure already that:
 	// 1. all messages are sent by different senders.
 	// 2. all messages are from the same round.
 	// 3. senders all part of the activa validator set for this height.
 	for round, msgSet := range q.state.roundChangeMessages {
-		fmt.Println("_ msg set _", msgSet)
-
-		// round is old
-		if round < curRound {
-			fmt.Println("A")
+		// there is not enough quorum for this round
+		if !msgSet.isQuorum(q.state.quorum) {
 			continue
 		}
 
-		// there is not enough quorum for this round
-		if !msgSet.isQuorum(q.state.quorum) {
-			fmt.Println("B", msgSet, msgSet.accumulatedVotingPower, q.state.quorum)
-			continue
+		for _, msg := range msgSet.messageMap {
+			// the round number of the Round-Change message is either:
+			// 1. higher than the current round
+			// 2. equal to the current round provided that no Proposal message for the round
+			// has been accepted
+			roundChange := msg.Payload.UnsignedPayload.RoundChange
+			if roundChange.Round < q.state.round && (roundChange.Round == q.state.round && q.state.acceptedPB != nil) {
+				continue
+			}
+
+			// the prepared-certificate is valid
+			if !q.isValidPC(roundChange.PreparedCertificate, q.state.round, q.backend.Height()) {
+				continue
+			}
+
+			// TODO: The block hash included in all of the messages in the prepared certificate
+			// corresponds to the hash of the proposed block included in the round-change message
 		}
 
 		// the prepared-certificate is valid
 		// q.isValidPC(nil, 0, 0)
-
-		fmt.Println("--rccset ", rccSet)
 
 		if rccSet == nil || maxRound < round {
 			rccSet = msgSet
@@ -331,23 +347,28 @@ func (q *QBFT) getExtendedRCC() (*messageSet[RoundChangeMessage], uint64) {
 		}
 	}
 
-	fmt.Println("_ END ", rccSet, maxRound)
-
 	return rccSet, maxRound
 }
 
 func (q *QBFT) startNewRound(round uint64) {
 	q.config.Logger.Printf("start new round, round=%d", round)
+
+	// TODO: unit test that the timeout is set with a round change
+	if round == 0 || round > q.state.round {
+		// double the timeout for each round
+		timeout := q.config.RoundTimeout.Seconds() + math.Pow(2, float64(round))
+		q.state.setTimeout(time.Duration(int64(timeout)) * time.Second)
+	}
+
 	q.state.round = round
 	q.state.acceptedPB = nil
 	q.state.commitSent = false
-
-	if round == 0 || round > q.state.round {
-		q.state.setTimer(5 * time.Second)
-	}
 }
 
 func (q *QBFT) startNewRoundAndSendRoundChange(newRound uint64) error {
+	q.config.Logger.Printf("[INFO] round change timeout, round=%d", newRound)
+	q.config.Logger.Printf("[INFO] proposer for round=%d is %s", newRound, q.backend.ValidatorSet().CalculateProposer(newRound))
+
 	q.startNewRound(newRound)
 
 	roundChange, err := q.signMessage(UnsignedPayload{RoundChange: &RoundChange{
@@ -373,12 +394,10 @@ func (q *QBFT) startNewRoundAndSendRoundChange(newRound uint64) error {
 }
 
 func (q *QBFT) uponRoundChange(m QBFTMessageWithRecipient) error {
-	q.config.Logger.Printf("[DEBUG] received 'round-change' message: from=%s, height=%d", m.Sender, m.Message.Height())
+	q.config.Logger.Printf("[DEBUG] received 'round-change' message: from=%s, height=%d, round=%d", m.Sender, m.Message.Height(), m.Message.Round())
 
 	if len(m.Message.RoundChangeMessage.Payload.UnsignedPayload.RoundChange.PreparedCertificate) != 0 {
 		// if it is included, it should be correct
-		fmt.Println("....", m.Message.RoundChangeMessage.Payload.UnsignedPayload.RoundChange.PreparedCertificate)
-
 		if !q.isValidPC(m.Message.RoundChangeMessage.Payload.UnsignedPayload.RoundChange.PreparedCertificate, 100, q.backend.Height()) {
 			panic("it should not happen")
 		}
@@ -397,10 +416,13 @@ func (q *QBFT) uponRoundChange(m QBFTMessageWithRecipient) error {
 
 	q.startNewRound(round)
 
+	q.config.Logger.Printf("[INFO]: New proposer, %s", q.backend.ValidatorSet().CalculateProposer(round))
+
 	if q.backend.ValidatorSet().CalculateProposer(round) != q.localID {
 		return nil
 	}
 
+	q.config.Logger.Printf("[INFO]: I am proposer for round change!")
 	// we are the proposer for this round change
 	// check if any of the round change messages includes a proposal for a block
 
@@ -467,16 +489,10 @@ func (q *QBFT) hasPartialRoundChangeQuorum() (bool, uint64) {
 	var minRound uint64
 	var minRoundSet bool
 
-	fmt.Println("xxxx")
-	fmt.Println(q.state.roundChangeMessages, currentRound)
-
 	for round, msgsPerRound := range q.state.roundChangeMessages {
 		if round <= currentRound {
 			continue
 		}
-
-		fmt.Println("----")
-		fmt.Println(round, msgsPerRound.messageMap)
 
 		if !minRoundSet && round < minRound {
 			minRound = round
@@ -487,9 +503,6 @@ func (q *QBFT) hasPartialRoundChangeQuorum() (bool, uint64) {
 		}
 	}
 
-	fmt.Println("-- senders --")
-	fmt.Println(senders)
-
 	if len(senders) > int(q.state.quorum)/2 {
 		// TODO
 		return true, minRound
@@ -499,8 +512,7 @@ func (q *QBFT) hasPartialRoundChangeQuorum() (bool, uint64) {
 
 func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 	if len(pc) == 0 {
-		fmt.Println("Pre")
-		return false
+		return true
 	}
 
 	var (
@@ -512,8 +524,6 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 	alreadyVoted := map[NodeID]struct{}{}
 
 	for _, container := range pc {
-		fmt.Println("_ container _", container.sender)
-
 		msg := container.UnsignedPayload
 		var msgRound uint64
 
@@ -522,7 +532,6 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 
 			// Only one pre per validator allowed
 			if _, ok := alreadyVoted[container.sender]; ok {
-				fmt.Println("A1")
 				return false
 			}
 			alreadyVoted[container.sender] = struct{}{}
@@ -530,7 +539,6 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 			// All the senders must exist in the validator set
 			votingPower, ok := q.state.validators.Exists(container.sender)
 			if !ok {
-				fmt.Println("A2")
 				return false
 			}
 			totalVotingPower += votingPower
@@ -540,18 +548,15 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 
 			// only one proposal allowed in the pc
 			if proposalFound {
-				fmt.Println("A3")
 				return false
 			}
 			proposalFound = true
 
 			// proposal is sent by the proposer
 			if q.state.validators.CalculateProposer(msgRound) != container.sender {
-				fmt.Println("A4")
 				return false
 			}
 		} else {
-			fmt.Println("A5")
 			return false
 		}
 
@@ -559,7 +564,6 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 		if expectedRound == nil {
 			expectedRound = &msgRound
 		} else if *expectedRound != msgRound {
-			fmt.Println("A6")
 			return false
 		}
 	}
@@ -567,13 +571,11 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 	// the voting power of all the senders in the PC must be higher
 	// than the
 	if totalVotingPower < q.state.quorum {
-		fmt.Println("A7")
 		return false
 	}
 
 	// the round included in all the messages is lower than rlimit
 	if *expectedRound >= rlimit {
-		fmt.Println("A8")
 		return false
 	}
 
@@ -581,7 +583,7 @@ func (q *QBFT) isValidPC(pc []SignedContainer, rlimit, height uint64) bool {
 }
 
 func (q *QBFT) uponProposal(m QBFTMessageWithRecipient) error {
-	q.config.Logger.Printf("[DEBUG] received 'proposal' message: from=%s, height=%d", m.Sender, m.Message.Height())
+	q.config.Logger.Printf("[DEBUG] received 'proposal' message: from=%s, height=%d, round=%d", m.Sender, m.Message.Height(), m.Message.Round())
 
 	if q.state.acceptedPB != nil {
 		return nil
@@ -622,9 +624,6 @@ func (q *QBFT) uponProposal(m QBFTMessageWithRecipient) error {
 			return fmt.Errorf("unexpected proposer")
 		}
 
-		fmt.Println(msg.Payload.UnsignedPayload.Proposal)
-		fmt.Println(msg.RoundChangeCertificate)
-
 		// there is a quorum of rcc and messages are signed
 		// by different validators (the quorum is on the payload part)
 		// TODO: optimize
@@ -636,11 +635,9 @@ func (q *QBFT) uponProposal(m QBFTMessageWithRecipient) error {
 			roundChange := msg.UnsignedPayload.RoundChange
 
 			if roundChange.Height != q.backend.Height() {
-				fmt.Println("B0")
 				return false
 			}
 			if roundChange.Round != round {
-				fmt.Println("B!")
 				return false
 			}
 			return true
@@ -705,9 +702,7 @@ func (q *QBFT) isQuorum(msgs []SignedContainer, checkFn func(SignedContainer) bo
 	totalVotingPower := uint64(0)
 
 	for _, msg := range msgs {
-		fmt.Println("Sender", msg.sender)
 		if !checkFn(msg) {
-			fmt.Println("I")
 			return false
 		}
 
@@ -721,14 +716,12 @@ func (q *QBFT) isQuorum(msgs []SignedContainer, checkFn func(SignedContainer) bo
 		// All the senders must exist in the validator set
 		votingPower, ok := q.state.validators.Exists(msg.sender)
 		if !ok {
-			fmt.Println("G")
 			return false
 		}
 		totalVotingPower += votingPower
 	}
 
 	if totalVotingPower < q.state.quorum {
-		fmt.Println("F")
 		return false
 	}
 
@@ -736,15 +729,20 @@ func (q *QBFT) isQuorum(msgs []SignedContainer, checkFn func(SignedContainer) bo
 }
 
 func (q *QBFT) uponPrepare(msg QBFTMessageWithRecipient) error {
-	q.config.Logger.Printf("[DEBUG] received 'prepare' message: from=%s, height=%d", msg.Sender, msg.Message.Height())
+	// dummy way to insert the data and call it without a message
+	q.config.Logger.Printf("[DEBUG] received 'prepare' message: from=%s, height=%d, round=%d", msg.Sender, msg.Message.Height(), msg.Message.Round())
 
 	if !q.state.addMessage(msg) {
 		return nil
 	}
 
 	// check if there is quorum for the updated round
-	prepareMsg := msg.Message.PrepareMessage.Payload.UnsignedPayload.Prepare
-	if !q.state.preparedMessages.atRound(prepareMsg.Round).isQuorum(q.state.quorum) {
+	if !q.state.preparedMessages.atRound(q.state.round).isQuorum(q.state.quorum) {
+		return nil
+	}
+
+	// we have not seen yet the proposal
+	if q.state.acceptedPB == nil {
 		return nil
 	}
 
@@ -783,8 +781,6 @@ func (q *QBFT) uponPrepare(msg QBFTMessageWithRecipient) error {
 
 	q.state.commitSent = true
 
-	fmt.Println("_ is local ? _")
-
 	ownMsg := q.multicast(QBFTMessagePayload{CommitMessage: &commitMsg})
 	if err := q.uponCommit(ownMsg); err != nil {
 		return err
@@ -794,7 +790,7 @@ func (q *QBFT) uponPrepare(msg QBFTMessageWithRecipient) error {
 }
 
 func (q *QBFT) uponCommit(msg QBFTMessageWithRecipient) error {
-	q.config.Logger.Printf("[DEBUG] received 'commit' message: from=%s, height=%d", msg.Sender, msg.Message.Height())
+	q.config.Logger.Printf("[DEBUG] received 'commit' message: from=%s, height=%d, round=%d", msg.Sender, msg.Message.Height(), msg.Message.Round())
 
 	if !q.state.addMessage(msg) {
 		return nil
@@ -805,14 +801,22 @@ func (q *QBFT) uponCommit(msg QBFTMessageWithRecipient) error {
 		return nil
 	}
 
-	q.config.Logger.Printf("[INFO]: quorum of commits")
-	fmt.Println(q.state.commitMessages.atRound(q.state.round).messageMap)
+	if q.state.acceptedPB == nil {
+		return nil
+	}
 
+	if q.state.finalisedBlockSent {
+		return nil
+	}
+
+	q.config.Logger.Printf("[INFO]: quorum of commits")
 	q.config.Logger.Print("Insert proposal")
 
 	sealedProposal := &SealedProposal{
 		Block: q.state.acceptedPB.Copy(),
 	}
+
+	q.state.finalisedBlockSent = true
 
 	q.backend.Insert(sealedProposal)
 	q.finish()
@@ -833,7 +837,7 @@ func (q *QBFT) signMessage(msg UnsignedPayload) (SignedContainer, error) {
 }
 
 func (q *QBFT) multicast(msg QBFTMessagePayload) QBFTMessageWithRecipient {
-	q.config.Logger.Printf("[INFO] multicast message: type=%s", msg.typ())
+	q.config.Logger.Printf("[INFO] multicast message: type=%s, round=%d, height=%d", msg.typ(), msg.Round(), msg.Height())
 
 	err := q.config.Transport.Send(&QBFTMessageWithRecipient{
 		Message: msg,
