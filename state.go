@@ -12,12 +12,14 @@ type state struct {
 	quorum uint64
 
 	// timeoutCh is closed when the timeout for the round has expired
-	timeoutTimer *time.Timer
+	// timeoutTimer *time.Timer
+	timer Timer
 
 	latestPC                    []SignedContainer
 	acceptedPB                  *Block
 	commitSent                  bool
 	latestPreparedProposedBlock *Block
+	finalisedBlockSent          bool
 
 	// list of messages received and processed
 	preparedMessages    messageSetByRound[PrepareMessage]
@@ -26,12 +28,33 @@ type state struct {
 	roundChangeMessages messageSetByRound[RoundChangeMessage]
 }
 
-func newState() *state {
-	return &state{}
+type defaultTimer struct {
+	timer *time.Timer
 }
 
-func (s *state) setTimer(timeout time.Duration) {
-	s.timeoutTimer.Reset(timeout)
+func (d *defaultTimer) TimeCh() <-chan time.Time {
+	return d.timer.C
+}
+
+func (d *defaultTimer) SetTimeout(duration time.Duration) {
+	d.timer.Reset(duration)
+}
+
+func newDefaultTimer() Timer {
+	timer := time.NewTimer(0)
+	timer.Stop()
+
+	return &defaultTimer{timer: timer}
+}
+
+func newState(timer Timer) *state {
+	return &state{
+		timer: timer,
+	}
+}
+
+func (s *state) setTimeout(timeout time.Duration) {
+	s.timer.SetTimeout(timeout)
 }
 
 func (s *state) resetState(validators ValidatorSet) {
@@ -40,13 +63,11 @@ func (s *state) resetState(validators ValidatorSet) {
 	s.round = 0
 	s.quorum, _ = getQuorumNumbers(s.validators.VotingPower())
 
-	s.timeoutTimer = time.NewTimer(0)
-	s.timeoutTimer.Stop()
-
 	s.latestPC = []SignedContainer{}
 	s.acceptedPB = nil
 	s.commitSent = false
 	s.latestPreparedProposedBlock = nil
+	s.finalisedBlockSent = false
 
 	// initialize message sets
 	s.proposalMessages = make(messageSetByRound[ProposalMessage])
@@ -95,10 +116,6 @@ func (m *messageSetByRound[T]) atRound(round uint64) *messageSet[T] {
 type messageSet[T any] struct {
 	messageMap             map[NodeID]T
 	accumulatedVotingPower uint64
-}
-
-func (m *messageSet[T]) length() uint64 {
-	return uint64(len(m.messageMap))
 }
 
 func (m *messageSet[T]) addMessage(message T, from NodeID, votingPower uint64) bool {
